@@ -2165,6 +2165,41 @@ export async function customerEventNeedsRetry(chatId,eventId,{staleSeconds=120}=
   const r=await pool.query(`SELECT 1 FROM customer_event_processing WHERE chat_id=$1 AND event_id=$2 AND available_at<=now() AND (status IN ('PENDING','FAILED') OR (status='BLOCKED' AND (blocked_until IS NULL OR blocked_until<=now())) OR (status='PROCESSING' AND claimed_at < now()-($3::text||' seconds')::interval)) LIMIT 1`,[c,e,String(stale)]);
   return r.rowCount>0;
 }
+export async function scheduleRunnableCustomerEventRecovery(limit=24){
+  const n=Math.max(1,Math.min(Number(limit)||24,100));
+  // First terminalize ledger rows that can no longer belong to the current active session.
+  // These rows must never be replayed into a newer session for the same LiveChat chat id.
+  const obsolete=await pool.query(`UPDATE customer_event_processing e SET status='DEAD',completed_at=now(),
+      last_error=COALESCE(e.last_error,'EVENT_SESSION_OBSOLETE'),last_error_code='EVENT_SESSION_OBSOLETE',last_error_class='PERMANENT',
+      last_error_at=now(),next_retry_at=NULL,blocked_reason=NULL,blocked_until=NULL,updated_at=now()
+    FROM conversations c
+    WHERE c.chat_id=e.chat_id AND e.status IN ('PENDING','FAILED','BLOCKED') AND e.available_at<=now()
+      AND (c.status='closed' OR c.lc_active=false OR (e.session_id IS NOT NULL AND c.session_id IS NOT NULL AND e.session_id<>c.session_id))`);
+
+  // Recovery is deliberately producer-only: processCustomerMessage remains the sole claimant
+  // of the event ledger. We enqueue a fresh state sync for distinct active MY_CHAT conversations;
+  // syncChatById will rediscover the exact provider event and the normal per-event claim then
+  // provides idempotency. This avoids a second worker claiming an event before the engine can.
+  const rows=(await pool.query(`SELECT DISTINCT ON (e.chat_id) e.chat_id,e.event_id,e.thread_id,e.attempts,e.available_at
+    FROM customer_event_processing e
+    JOIN conversations c ON c.chat_id=e.chat_id
+    WHERE e.status IN ('PENDING','FAILED','BLOCKED') AND e.available_at<=now()
+      AND (e.status<>'BLOCKED' OR e.blocked_until IS NULL OR e.blocked_until<=now())
+      AND c.status<>'closed' AND c.lc_active=true AND COALESCE(c.lc_lane,'')='MY_CHAT'
+      AND (e.session_id IS NULL OR c.session_id IS NULL OR e.session_id=c.session_id)
+    ORDER BY e.chat_id,e.available_at,e.created_at,e.event_id LIMIT $1`,[n])).rows;
+  let queued=0;
+  for(const row of rows){
+    const job=await enqueueLiveChatIngressJob({
+      dedupeKey:`event-recovery:${row.chat_id}:${row.event_id}:${Number(row.attempts)||0}`,
+      jobType:'SYNC_CHAT',chatId:row.chat_id,threadId:row.thread_id||null,eventId:row.event_id,
+      payload:{source:'customer_event_recovery',eventId:row.event_id},priority:98
+    });
+    if(job) queued++;
+  }
+  return {candidates:rows.length,queued,obsolete:obsolete.rowCount};
+}
+
 export async function customerEventProcessingStats(){
   const r=await pool.query(`SELECT count(*) FILTER(WHERE status='PENDING')::int pending,count(*) FILTER(WHERE status='PROCESSING')::int processing,count(*) FILTER(WHERE status='DONE')::int done,count(*) FILTER(WHERE status='FAILED')::int failed,count(*) FILTER(WHERE status='BLOCKED')::int blocked,count(*) FILTER(WHERE status='DEAD')::int dead,
     count(*) FILTER(WHERE status IN ('PENDING','FAILED','BLOCKED') AND available_at<=now() AND (status<>'BLOCKED' OR blocked_until IS NULL OR blocked_until<=now()))::int runnable,
