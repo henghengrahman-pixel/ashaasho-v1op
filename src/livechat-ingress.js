@@ -114,7 +114,23 @@ async function handleJob(job,livechat){
   if(type==='SYNC_CHAT'){
     if(!chatId) throw new Error('LIVECHAT_INGRESS_CHAT_ID_REQUIRED');
     const summary=job?.payload?.summary&&typeof job.payload.summary==='object'?job.payload.summary:{};
-    try{return await syncChatById(livechat,chatId,summary);}catch(e){
+    try{
+      const result=await syncChatById(livechat,chatId,summary);
+      // Recovery jobs target a specific durable customer event. If provider ownership changed,
+      // keep it BLOCKED; if a successful MY_CHAT snapshot no longer contains/processes that old
+      // event, terminalize it instead of leaving a permanently-runnable 24h ledger row.
+      if(text(job?.payload?.source)==='customer_event_recovery' && job.event_id){
+        const stillRunnable=await db.customerEventNeedsRetry(chatId,job.event_id,{staleSeconds:config.lcIngressStaleSeconds}).catch(()=>false);
+        if(stillRunnable){
+          if(String(result?.lane||'').toUpperCase() && String(result?.lane||'').toUpperCase()!=='MY_CHAT'){
+            await db.finishCustomerEventProcessing(chatId,job.event_id,{ok:false,error:'CHAT_NOT_IN_AI_LANE'}).catch(()=>{});
+          }else{
+            await db.finishCustomerEventProcessing(chatId,job.event_id,{ok:false,error:'EVENT_NOT_IN_PROVIDER_SNAPSHOT'}).catch(()=>{});
+          }
+        }
+      }
+      return result;
+    }catch(e){
       if(livechat.isChatInactiveError?.(e) || Number(e?.status)===404 || /chat\s+(?:is\s+)?(?:not\s+active|inactive)|no\s+active\s+thread/i.test(text(e?.message))){await db.markConversationEnded(chatId,{reason:'INGRESS_CONFIRMED_INACTIVE'});forgetChat(chatId);return {closed:true};}
       throw e;
     }
@@ -139,6 +155,13 @@ async function processJob(job,livechat){
 async function tick(livechat){
   if(running)return; running=true; lastRunAt=new Date().toISOString();
   try{
+    // Runnable customer-event retries are not a separate execution path. Convert a bounded
+    // set into high-priority SYNC_CHAT jobs so they re-enter the same provider/session/idempotency
+    // pipeline as fresh events. This is what drains FAILED/PENDING ledger rows that are no longer
+    // visible to the summary change detector.
+    await db.scheduleRunnableCustomerEventRecovery(Math.max(config.lcIngressBatchSize,config.lcIngressConcurrency*2)).catch(async e=>{
+      await db.logError('livechat_ingress','EVENT_RECOVERY_SCHEDULE_FAILED',String(e?.message||e)).catch(()=>{});
+    });
     const jobs=await db.claimLiveChatIngressJobs(config.lcIngressBatchSize,{workerId,staleSeconds:config.lcIngressStaleSeconds});
     let cursor=0; const count=Math.min(config.lcIngressConcurrency,jobs.length||1);
     const workers=Array.from({length:count},async()=>{while(true){const i=cursor++;if(i>=jobs.length)break;inFlight++;try{await processJob(jobs[i],livechat);}finally{inFlight--;}}});
